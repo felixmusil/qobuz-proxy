@@ -24,6 +24,7 @@ from .capabilities import (
     apply_device_overrides,
     build_protocol_info,
 )
+from .standby import StandbyDetector, select_standby_detector
 
 if TYPE_CHECKING:
     from .proxy_server import AudioProxyServer
@@ -110,6 +111,9 @@ class DLNABackend(AudioBackend):
         # Sonos queue-based playback (for Sonos app metadata display)
         self._is_sonos: bool = False
 
+        # Per-device standby detector (None → use the position heuristic)
+        self._standby_detector: Optional[StandbyDetector] = None
+
     # =========================================================================
     # Lifecycle
     # =========================================================================
@@ -144,6 +148,17 @@ class DLNABackend(AudioBackend):
 
             # Query device capabilities
             await self._discover_capabilities(device_info)
+
+            # Pick a standby detector for this device type (None → heuristic).
+            self._standby_detector = select_standby_detector(device_info, self._ip)
+            if self._standby_detector is not None:
+                logger.info(
+                    "Standby detection: using %s for %s",
+                    self._standby_detector.name,
+                    self.name,
+                )
+            else:
+                logger.debug("Standby detection: none for %s — using position heuristic", self.name)
 
             self._is_connected = True
 
@@ -210,6 +225,9 @@ class DLNABackend(AudioBackend):
             except Exception:
                 pass
             await self._client.disconnect()
+
+        if self._standby_detector is not None:
+            await self._standby_detector.aclose()
 
         logger.info(f"Disconnected from DLNA device: {self.name}")
 
@@ -545,6 +563,24 @@ class DLNABackend(AudioBackend):
             return True
         return self._position_ms >= self._duration_ms - TRACK_END_POSITION_THRESHOLD_MS
 
+    async def _classify_stop_is_external(self) -> bool:
+        """Decide whether a PLAYING->STOPPED is an external stop (don't advance).
+
+        If a device-specific standby detector confirms the renderer is in standby /
+        powered off, that's authoritative (even near the track end). Otherwise fall
+        back to the position heuristic.
+        """
+        if self._standby_detector is not None:
+            try:
+                standby = await self._standby_detector.is_in_standby()
+            except Exception as e:
+                logger.debug(f"Standby probe failed: {type(e).__name__}: {e}")
+                standby = None
+            if standby is True:
+                logger.info("%s reports standby — external stop", self._standby_detector.name)
+                return True
+        return not self._is_natural_track_end()
+
     async def _poll_state_loop(self) -> None:
         """Poll device state periodically."""
         while self._is_connected:
@@ -615,20 +651,19 @@ class DLNABackend(AudioBackend):
                                 f"(started {time.monotonic() - self._playback_started_at:.1f}s ago)"
                             )
                             continue  # Skip state update entirely
-                        elif self._is_natural_track_end():
-                            self._notify_track_ended()
-                        else:
-                            # Stopped well before the end: the renderer was stopped
-                            # or powered off (network standby), not a finished track.
-                            # Don't auto-advance — that would re-issue Play and wake it.
+                        elif await self._classify_stop_is_external():
+                            # The renderer was stopped or powered off (network
+                            # standby), not a finished track. Don't auto-advance —
+                            # that would re-issue Play and wake the device.
                             logger.info(
-                                "Renderer stopped at %d/%d ms — treating as external "
-                                "stop (not advancing); the amp was likely turned off "
-                                "or stopped on the device.",
+                                "External stop for %s at %d/%d ms — not advancing.",
+                                self.name,
                                 self._position_ms,
                                 self._duration_ms,
                             )
                             self._notify_external_stop()
+                        else:
+                            self._notify_track_ended()
 
                     self._notify_state_change(new_state)
 
