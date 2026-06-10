@@ -105,3 +105,64 @@ class TestPlaybackSerialization:
         result = await stale
         assert result is False
         assert backend.played == []
+
+
+class TestApplyRemoteStateSerialization:
+    """A SET_STATE is load+seek+play applied as one atomic unit (apply_remote_state).
+
+    These cover the residual race from the PR review: overlapping SET_STATE
+    sequences must never interleave their load/play steps, so the newest one
+    always wins as a whole and playback never ends up on a stale track.
+    """
+
+    async def test_concurrent_apply_remote_state_never_overlaps(self) -> None:
+        player, backend = _make_player()
+
+        track_ids = [str(i) for i in range(1, 6)]
+        await asyncio.gather(
+            *(
+                player.apply_remote_state(
+                    track_id=t, queue_item_id=i, position_ms=0, playing_state=2
+                )
+                for i, t in enumerate(track_ids)
+            )
+        )
+
+        # No interleaving of the load/play steps across SET_STATE sequences.
+        assert backend.max_active == 1
+        # Newest SET_STATE wins as a unit — never left on a stale track.
+        assert player.current_track is not None
+        assert player.current_track.track_id == track_ids[-1]
+        assert backend.played[-1] == track_ids[-1]
+
+    async def test_newer_set_state_wins_when_queued_behind_older(self) -> None:
+        """Reproduce the reviewer's interleave: older sequence is in-flight, a newer
+        one is queued behind the lock, and a third (newest) supersedes the queued one.
+        The final track must be the newest, and the superseded one must not run."""
+        player, backend = _make_player()
+
+        # Older SET_STATE (track A) grabs the lock first and is mid-flight.
+        older = asyncio.create_task(
+            player.apply_remote_state(track_id="A", queue_item_id=1, position_ms=0, playing_state=2)
+        )
+        await asyncio.sleep(0)  # let A acquire the lock and start loading/playing
+
+        # A newer SET_STATE (track B) queues behind the lock...
+        newer = asyncio.create_task(
+            player.apply_remote_state(track_id="B", queue_item_id=2, position_ms=0, playing_state=2)
+        )
+        await asyncio.sleep(0)  # let B register its generation, then wait on the lock
+        # ...and an even newer SET_STATE (track C) supersedes B before B runs.
+        newest = asyncio.create_task(
+            player.apply_remote_state(track_id="C", queue_item_id=3, position_ms=0, playing_state=2)
+        )
+
+        await asyncio.gather(older, newer, newest)
+
+        assert backend.max_active == 1
+        # B was superseded by C and must never have played.
+        assert "B" not in backend.played
+        # Final state is the newest request (C).
+        assert player.current_track is not None
+        assert player.current_track.track_id == "C"
+        assert backend.played[-1] == "C"

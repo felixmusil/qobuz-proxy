@@ -26,6 +26,13 @@ logger = logging.getLogger(__name__)
 # Threshold for restart vs previous track (milliseconds)
 PREVIOUS_TRACK_THRESHOLD_MS = 3000
 
+# After a WebSocket reconnect, the Qobuz server replays its last-known session
+# snapshot via SET_STATE — typically PAUSED at a position from before the drop.
+# If the renderer is actually still playing further along the same track, treat
+# that as a stale replay and ignore the pause/seek. This is the minimum gap
+# (renderer ahead of server) at which we suppress.
+_STALE_SNAPSHOT_THRESHOLD_MS = 5000
+
 
 class QobuzPlayer:
     """
@@ -368,6 +375,105 @@ class QobuzPlayer:
         """
         self._command_generation += 1
         return self._command_generation
+
+    async def apply_remote_state(
+        self,
+        *,
+        track_id: Optional[str],
+        queue_item_id: Optional[int],
+        position_ms: Optional[int],
+        playing_state: Optional[int],
+    ) -> None:
+        """Apply a full SET_STATE intent from the app atomically.
+
+        A SET_STATE is a multi-step intent (load this track, seek here, then
+        play/pause/stop). Each SET_STATE message is dispatched as its own task,
+        so if these steps were applied via separate locked methods they could
+        interleave — an older SET_STATE could play a stale track after a newer
+        one already queued a different load. Applying the whole sequence under a
+        single lock acquisition and a single generation check makes the newest
+        SET_STATE win as a unit, with no interleaving.
+
+        Args:
+            track_id: Target track id, or None if the message had no currentQueueItem.
+            queue_item_id: Queue item id for the target track (if any).
+            position_ms: Target position, or None if no currentPosition was sent.
+            playing_state: Proto playing state (1=STOPPED, 2=PLAYING, 3=PAUSED),
+                or None if the message had no playingState.
+        """
+        gen = self._next_generation()
+        async with self._playback_lock:
+            if gen != self._command_generation:
+                logger.debug("SET_STATE superseded by newer command; skipping")
+                return
+
+            # Load if a track is specified and differs from the loaded one.
+            if track_id is not None:
+                cur = self._current_track
+                if cur is None or cur.track_id != track_id:
+                    logger.info(f"Loading new track: {track_id}")
+                    if not await self._load_track_locked(queue_item_id or 0, track_id):
+                        return
+
+            # Detect a stale session-restore snapshot (server replays an old
+            # PAUSED position after a reconnect while we're still playing).
+            stale = self._is_stale_pause_snapshot_locked(track_id, position_ms, playing_state)
+
+            # Position, then play/pause/stop — same order as the app expects.
+            if position_ms is not None and not stale:
+                await self.seek(position_ms)
+
+            if playing_state is not None and not stale:
+                # Proto: 1=STOPPED, 2=PLAYING, 3=PAUSED
+                if playing_state == 2:
+                    await self._play_locked(position_ms or 0)
+                elif playing_state == 3:
+                    await self._pause_locked()
+                elif playing_state == 1:
+                    await self._stop_playback_locked()
+
+    def _is_stale_pause_snapshot_locked(
+        self,
+        track_id: Optional[str],
+        position_ms: Optional[int],
+        playing_state: Optional[int],
+    ) -> bool:
+        """Decide whether an inbound SET_STATE is a stale session-restore replay.
+
+        Must be called while holding ``_playback_lock`` so the live player state
+        it reads is consistent with the surrounding mutation. Returns True when
+        ALL of:
+          - server says PAUSED
+          - renderer is still PLAYING
+          - it's the same track the renderer is on
+          - server position is more than _STALE_SNAPSHOT_THRESHOLD_MS behind the
+            renderer's actual position
+        """
+        if playing_state != 3:
+            return False
+        if self._state != PlaybackState.PLAYING:
+            return False
+        if position_ms is None:
+            return False
+        # A different target track is a real command (track change), not a replay.
+        cur = self._current_track
+        if track_id is not None and (cur is None or cur.track_id != track_id):
+            return False
+
+        actual_pos = self.current_position_ms
+        gap_ms = actual_pos - position_ms
+        if gap_ms <= _STALE_SNAPSHOT_THRESHOLD_MS:
+            return False
+
+        logger.info(
+            "Ignoring stale SET_STATE: server says PAUSED at %dms, renderer is "
+            "PLAYING at %dms (%.1fs ahead) on same track — likely a session-"
+            "restore replay after WebSocket reconnect; keeping playback.",
+            position_ms,
+            actual_pos,
+            gap_ms / 1000.0,
+        )
+        return True
 
     async def play(self, position_ms: int = 0) -> bool:
         """
