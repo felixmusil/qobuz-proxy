@@ -37,6 +37,14 @@ STATE_POLL_INTERVAL_SECONDS = 2.0
 # This prevents false track-ended events while the device is loading
 PLAYBACK_START_GRACE_PERIOD_SECONDS = 5.0
 
+# How close to the track end (ms) a STOPPED transition must be to count as a
+# natural track end. A STOPPED reported well before this means the renderer was
+# stopped or powered off (network standby) — not a finished track — so we must
+# not auto-advance (which would re-issue Play and wake the device). The margin
+# absorbs the 2 s poll interval plus a little slack, since position is only
+# sampled while PLAYING and can be slightly stale at the STOPPED poll.
+TRACK_END_POSITION_THRESHOLD_MS = 7000
+
 # Class-level capability cache (shared across instances)
 _capability_cache = CapabilityCache()
 
@@ -525,6 +533,18 @@ class DLNABackend(AudioBackend):
     # Internal
     # =========================================================================
 
+    def _is_natural_track_end(self) -> bool:
+        """Whether a PLAYING->STOPPED transition looks like a finished track.
+
+        True if the last sampled position was within TRACK_END_POSITION_THRESHOLD_MS
+        of the track duration (or the duration is unknown, in which case we keep the
+        previous behaviour and advance). False means the renderer was stopped well
+        before the end — an external stop / power-off — and we should not auto-advance.
+        """
+        if self._duration_ms <= 0:
+            return True
+        return self._position_ms >= self._duration_ms - TRACK_END_POSITION_THRESHOLD_MS
+
     async def _poll_state_loop(self) -> None:
         """Poll device state periodically."""
         while self._is_connected:
@@ -595,8 +615,20 @@ class DLNABackend(AudioBackend):
                                 f"(started {time.monotonic() - self._playback_started_at:.1f}s ago)"
                             )
                             continue  # Skip state update entirely
-                        else:
+                        elif self._is_natural_track_end():
                             self._notify_track_ended()
+                        else:
+                            # Stopped well before the end: the renderer was stopped
+                            # or powered off (network standby), not a finished track.
+                            # Don't auto-advance — that would re-issue Play and wake it.
+                            logger.info(
+                                "Renderer stopped at %d/%d ms — treating as external "
+                                "stop (not advancing); the amp was likely turned off "
+                                "or stopped on the device.",
+                                self._position_ms,
+                                self._duration_ms,
+                            )
+                            self._notify_external_stop()
 
                     self._notify_state_change(new_state)
 

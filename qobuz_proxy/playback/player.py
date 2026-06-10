@@ -123,6 +123,7 @@ class QobuzPlayer:
         self.backend.on_playback_error(self._on_playback_error)
         self.backend.on_position_update(self._on_position_update)
         self.backend.on_next_track_started(self._on_next_track_started)
+        self.backend.on_external_stop(self._on_external_stop)
 
         logger.info("QobuzPlayer initialized")
 
@@ -1075,6 +1076,32 @@ class QobuzPlayer:
         logger.error(f"Playback error: {message}")
         self._state = PlaybackState.ERROR
         asyncio.create_task(self._send_state_update())
+
+    def _on_external_stop(self) -> None:
+        """Callback when the renderer was stopped mid-track (e.g. amp powered off)."""
+        logger.info("Renderer stopped externally — stopping session (no auto-advance)")
+        asyncio.create_task(self._handle_external_stop())
+
+    async def _handle_external_stop(self) -> None:
+        """Stop the session without auto-advancing.
+
+        The renderer was stopped/powered off mid-track. Auto-advancing would
+        re-issue Play and wake the device, so instead we just reflect STOPPED to
+        the Qobuz app. The user can resume from the app (a new SET_STATE), which
+        supersedes this via the generation guard.
+        """
+        gen = self._next_generation()
+        async with self._playback_lock:
+            if gen != self._command_generation:
+                logger.debug("external stop superseded by newer command; skipping")
+                return
+            # Device is already stopped/off — do not send SOAP to it, just reset
+            # local state and report STOPPED. No auto-advance.
+            self._clear_gapless_state()
+            self._state = PlaybackState.STOPPED
+            self._position_value_ms = 0
+            self._position_timestamp_ms = int(time.time() * 1000)
+            await self._send_state_update()
 
     def _on_position_update(self, position_ms: int) -> None:
         """Callback when backend reports position update."""

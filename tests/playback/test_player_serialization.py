@@ -168,3 +168,22 @@ class TestApplyRemoteStateSerialization:
         assert player.current_track is not None
         assert player.current_track.track_id == "C"
         assert backend.played[-1] == "C"
+
+
+class TestExternalStop:
+    """When the renderer is stopped mid-track, the session stops without advancing."""
+
+    async def test_external_stop_stops_without_advancing(self) -> None:
+        player, backend = _make_player()
+
+        await player.apply_remote_state(
+            track_id="1", queue_item_id=1, position_ms=0, playing_state=2
+        )
+        assert player.state == PlaybackState.PLAYING
+        played_before = list(backend.played)
+
+        await player._handle_external_stop()
+
+        # Session stopped, and nothing new was played (no auto-advance / Play).
+        assert player.state == PlaybackState.STOPPED
+        assert backend.played == played_before

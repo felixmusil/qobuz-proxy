@@ -24,6 +24,7 @@ BufferStatusCallback = Callable[[BufferStatus], None]
 TrackEndedCallback = Callable[[], None]
 PlaybackErrorCallback = Callable[[str], None]  # error_message
 NextTrackStartedCallback = Callable[[], None]
+ExternalStopCallback = Callable[[], None]  # renderer stopped mid-track (e.g. powered off)
 
 
 class AudioBackend(ABC):
@@ -54,6 +55,7 @@ class AudioBackend(ABC):
         self._on_track_ended: Optional[TrackEndedCallback] = None
         self._on_playback_error: Optional[PlaybackErrorCallback] = None
         self._on_next_track_started: Optional[NextTrackStartedCallback] = None
+        self._on_external_stop: Optional[ExternalStopCallback] = None
 
     # =========================================================================
     # Playback Control - Required
@@ -192,6 +194,10 @@ class AudioBackend(ABC):
         """Register callback for playback errors."""
         self._on_playback_error = callback
 
+    def on_external_stop(self, callback: Optional[ExternalStopCallback]) -> None:
+        """Register callback for an external stop (renderer stopped mid-track)."""
+        self._on_external_stop = callback
+
     # =========================================================================
     # Event Notification Helpers
     # =========================================================================
@@ -237,6 +243,14 @@ class AudioBackend(ABC):
                 self._on_playback_error(message)
             except Exception as e:
                 logger.error(f"Playback error callback error: {e}")
+
+    def _notify_external_stop(self) -> None:
+        """Notify listeners that the renderer stopped mid-track (external stop)."""
+        if self._on_external_stop:
+            try:
+                self._on_external_stop()
+            except Exception as e:
+                logger.error(f"External stop callback error: {e}")
 
     def _notify_next_track_started(self) -> None:
         """Notify listeners that a gapless transition to the next track occurred."""
