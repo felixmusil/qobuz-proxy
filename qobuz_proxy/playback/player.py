@@ -937,6 +937,9 @@ class QobuzPlayer:
                     track.metadata = meta
                     track.duration_ms = meta.get("duration_ms", 0)
 
+            # Get actual quality and format info from cache (set during URL fetch)
+            actual_quality, sample_rate, bit_depth = self.metadata.get_track_format(track.track_id)
+
             # Build backend metadata
             backend_meta = BackendTrackMetadata(
                 track_id=track.track_id,
@@ -949,13 +952,12 @@ class QobuzPlayer:
                 album=meta.get("album", "") if meta else "",
                 duration_ms=track.duration_ms,
                 artwork_url=meta.get("artwork_url", "") if meta else "",
+                sample_rate=sample_rate,
+                bit_depth=bit_depth,
             )
 
-            # Get actual quality from cache (set during URL fetch)
-            actual_quality = self.metadata.get_track_actual_quality(track.track_id)
-
-            # Log now playing with actual quality
-            self.metadata.log_now_playing_info(backend_meta, actual_quality)
+            # Log now playing with actual quality (0 = cache miss, fall back to max quality)
+            self.metadata.log_now_playing_info(backend_meta, actual_quality or None)
 
             # Report file quality if callback is set
             if self._file_quality_report_callback:
@@ -1112,6 +1114,7 @@ class QobuzPlayer:
 
             meta = await self._get_track_metadata(track_id)
 
+            _, sample_rate, bit_depth = self.metadata.get_track_format(track_id)
             backend_meta = BackendTrackMetadata(
                 track_id=track_id,
                 title=meta.get("title", f"Track {track_id}") if meta else f"Track {track_id}",
@@ -1119,6 +1122,8 @@ class QobuzPlayer:
                 album=meta.get("album", "") if meta else "",
                 duration_ms=meta.get("duration_ms", 0) if meta else 0,
                 artwork_url=meta.get("artwork_url", "") if meta else "",
+                sample_rate=sample_rate,
+                bit_depth=bit_depth,
             )
 
             success = await self.backend.set_next_track(url, backend_meta, queue_item_id)

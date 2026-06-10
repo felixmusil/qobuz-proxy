@@ -265,6 +265,7 @@ class AudioProxyServer:
         timeout = ClientTimeout(total=None, connect=30, sock_read=READ_TIMEOUT_SECONDS)
 
         last_error = "Upstream fetch failed"
+        is_range = range_header is not None
         for attempt in range(UPSTREAM_MAX_ATTEMPTS):
             try:
                 logger.debug(
@@ -296,10 +297,11 @@ class AudioProxyServer:
                             "Content-Type": track.content_type,
                             "Accept-Ranges": "bytes",
                         }
+                        expected_bytes: Optional[int] = None
                         if "Content-Length" in upstream_response.headers:
-                            response_headers["Content-Length"] = upstream_response.headers[
-                                "Content-Length"
-                            ]
+                            cl = upstream_response.headers["Content-Length"]
+                            response_headers["Content-Length"] = cl
+                            expected_bytes = int(cl) if cl.isdigit() else None
                         if "Content-Range" in upstream_response.headers:
                             response_headers["Content-Range"] = upstream_response.headers[
                                 "Content-Range"
@@ -310,9 +312,11 @@ class AudioProxyServer:
                         )
 
                         # Headers are about to be committed — past this point a
-                        # failure cannot be retried.
+                        # failure cannot be retried, so it is logged and the
+                        # partial response returned (the device re-requests via Range).
                         response = web.StreamResponse(status=status, headers=response_headers)
                         bytes_sent = 0
+                        stream_start = time.monotonic()
                         try:
                             await response.prepare(request)
                             async for chunk in upstream_response.content.iter_chunked(
@@ -322,23 +326,38 @@ class AudioProxyServer:
                                     await response.write(chunk)
                                     bytes_sent += len(chunk)
                                 except (ConnectionResetError, ConnectionError):
-                                    logger.debug(
-                                        f"Client disconnected after {bytes_sent} bytes "
-                                        f"for track {track.track_id}"
+                                    self._log_stream_end(
+                                        track=track,
+                                        bytes_sent=bytes_sent,
+                                        expected_bytes=expected_bytes,
+                                        elapsed=time.monotonic() - stream_start,
+                                        is_range=is_range,
+                                        completed=False,
                                     )
                                     return response
                             await response.write_eof()
-                            logger.debug(
-                                f"Finished streaming track {track.track_id}, "
-                                f"sent {bytes_sent} bytes"
+                            self._log_stream_end(
+                                track=track,
+                                bytes_sent=bytes_sent,
+                                expected_bytes=expected_bytes,
+                                elapsed=time.monotonic() - stream_start,
+                                is_range=is_range,
+                                completed=True,
                             )
                         except asyncio.CancelledError:
                             raise
                         except Exception as e:
-                            expected = upstream_response.headers.get("Content-Length", "?")
+                            self._log_stream_end(
+                                track=track,
+                                bytes_sent=bytes_sent,
+                                expected_bytes=expected_bytes,
+                                elapsed=time.monotonic() - stream_start,
+                                is_range=is_range,
+                                completed=False,
+                            )
                             logger.warning(
-                                f"Upstream stream interrupted for track {track.track_id} "
-                                f"after {bytes_sent}/{expected} bytes: {type(e).__name__}: {e}"
+                                f"Upstream stream interrupted for track {track.track_id}: "
+                                f"{type(e).__name__}: {e}"
                             )
                         return response
 
@@ -363,6 +382,62 @@ class AudioProxyServer:
                 return web.Response(status=502, text=f"Proxy error: {last_error}")
 
         return web.Response(status=502, text=last_error)
+
+    def _log_stream_end(
+        self,
+        track: RegisteredTrack,
+        bytes_sent: int,
+        expected_bytes: Optional[int],
+        elapsed: float,
+        is_range: bool,
+        completed: bool,
+    ) -> None:
+        """Log the outcome of a proxied stream with throughput diagnostics.
+
+        Distinguishes a genuine mid-stream drop (renderer gave up or its buffer
+        underran) from benign disconnects (a Sonos probe, a seek, or a finished
+        transfer). Average throughput is included so we can tell *which*: a low
+        Mbit/s well under the stream bitrate points at the proxy/network not
+        keeping the device's buffer full; a high rate that simply stops points
+        at the renderer being unable to sustain decode/output at this quality.
+        """
+        rate_mbps = (bytes_sent * 8 / elapsed / 1_000_000) if elapsed > 0 else 0.0
+        pct = f"{bytes_sent / expected_bytes * 100:.1f}%" if expected_bytes else "?"
+
+        # A mid-transfer drop: a full-body request (not a range/seek) that ended
+        # well short of the advertised length. This is the stutter/stop symptom.
+        short = expected_bytes is not None and bytes_sent < expected_bytes * 0.95
+        if not completed and short and not is_range:
+            logger.warning(
+                "Renderer dropped track %s mid-stream: sent %d/%d bytes (%s) in "
+                "%.1fs (%.2f Mbit/s avg). Suspect buffer underrun or renderer "
+                "cannot sustain this quality.",
+                track.track_id,
+                bytes_sent,
+                expected_bytes,
+                pct,
+                elapsed,
+                rate_mbps,
+            )
+        elif completed:
+            logger.debug(
+                "Finished streaming track %s: %d bytes in %.1fs (%.2f Mbit/s avg)",
+                track.track_id,
+                bytes_sent,
+                elapsed,
+                rate_mbps,
+            )
+        else:
+            logger.debug(
+                "Client disconnected after %d bytes (%s) for track %s "
+                "(range=%s, %.1fs, %.2f Mbit/s avg)",
+                bytes_sent,
+                pct,
+                track.track_id,
+                is_range,
+                elapsed,
+                rate_mbps,
+            )
 
     def _get_local_ip(self) -> str:
         """Get local IP address for proxy URL."""

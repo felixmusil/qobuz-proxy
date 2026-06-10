@@ -62,6 +62,8 @@ def _make_player() -> tuple[QobuzPlayer, ConcurrencyTrackingBackend]:
     )
     metadata.get_metadata = MagicMock(side_effect=lambda track_id: _coro(None))
     metadata.get_track_actual_quality = MagicMock(return_value=None)
+    # (actual_quality, sample_rate, bit_depth); 0s = cache miss, fall back to max quality.
+    metadata.get_track_format = MagicMock(return_value=(0, 0, 0))
     metadata.log_now_playing_info = MagicMock()
 
     queue = MagicMock()
