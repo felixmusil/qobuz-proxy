@@ -416,6 +416,9 @@ class Speaker:
                 )
                 self._ws_manager.set_tokens(tokens)
                 self._ws_manager.set_max_audio_quality(self._effective_quality)
+                # Each (re)join makes the server replay its session snapshot; the
+                # player must not obey a replayed PAUSED while it is still playing.
+                self._ws_manager.on_connected(self._player.note_session_joined)
 
                 # Create handlers
                 self._queue_handler = QueueHandler(self._queue)

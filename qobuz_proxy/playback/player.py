@@ -39,6 +39,10 @@ _HANDOFF_POSITION_THRESHOLD_MS = 5000
 # that as a stale replay and ignore the pause/seek. This is the minimum gap
 # (renderer ahead of server) at which we suppress.
 _STALE_SNAPSHOT_THRESHOLD_MS = 5000
+# A reconnect for a token renewal takes well under a second, so its replayed
+# snapshot is only that far behind and the gap rule can't catch it. Right after a
+# (re)join, any PAUSED replay of the playing track is treated as stale.
+_REJOIN_REPLAY_WINDOW_S = 5.0
 
 
 class QobuzPlayer:
@@ -94,6 +98,8 @@ class QobuzPlayer:
         # the lock (latest-command-wins).
         self._playback_lock = asyncio.Lock()
         self._command_generation = 0
+        # monotonic time of the last WebSocket (re)join, for stale-replay detection
+        self._session_joined_at: Optional[float] = None
 
         # State reporting - supports both callback and StateReporter
         self._state_update_callback: Optional[Callable[[], asyncio.Future]] = None
@@ -429,6 +435,10 @@ class QobuzPlayer:
             # Detect a stale session-restore snapshot (server replays an old
             # PAUSED position after a reconnect while we're still playing).
             stale = self._is_stale_pause_snapshot_locked(track_id, position_ms, playing_state)
+            if stale:
+                # The server and app now believe we're paused; correct them at once
+                # rather than at the next periodic report.
+                await self._send_state_update()
 
             # Position, then play/pause/stop — same order as the app expects.
             if position_ms is not None and not stale:
@@ -442,6 +452,10 @@ class QobuzPlayer:
                     await self._pause_locked()
                 elif playing_state == 1:
                     await self._stop_playback_locked()
+
+    def note_session_joined(self) -> None:
+        """Record a WebSocket (re)join; the server replays its session snapshot next."""
+        self._session_joined_at = time.monotonic()
 
     def _is_stale_pause_snapshot_locked(
         self,
@@ -458,7 +472,8 @@ class QobuzPlayer:
           - renderer is still PLAYING
           - it's the same track the renderer is on
           - server position is more than _STALE_SNAPSHOT_THRESHOLD_MS behind the
-            renderer's actual position
+            renderer's actual position, or the session was (re)joined within
+            _REJOIN_REPLAY_WINDOW_S (the first such replay only)
         """
         if playing_state != 3:
             return False
@@ -473,7 +488,11 @@ class QobuzPlayer:
 
         actual_pos = self.current_position_ms
         gap_ms = actual_pos - position_ms
-        if gap_ms <= _STALE_SNAPSHOT_THRESHOLD_MS:
+        joined_at, self._session_joined_at = self._session_joined_at, None
+        just_joined = (
+            joined_at is not None and time.monotonic() - joined_at <= _REJOIN_REPLAY_WINDOW_S
+        )
+        if gap_ms <= _STALE_SNAPSHOT_THRESHOLD_MS and not just_joined:
             return False
 
         logger.info(
