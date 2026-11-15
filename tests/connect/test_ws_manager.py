@@ -6,7 +6,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from qobuz_proxy.auth.tokens import WSToken
 from qobuz_proxy.config import Config
+from qobuz_proxy.connect import ws_manager as ws_manager_module
 from qobuz_proxy.connect.types import ConnectTokens, JWTConnectToken
 from qobuz_proxy.connect.ws_manager import (
     INITIAL_RECONNECT_DELAY,
@@ -143,6 +145,76 @@ class TestTokenManagement:
         await asyncio.sleep(0)
 
         ws_manager._ws.close.assert_awaited_once()
+
+
+def _expired_tokens() -> ConnectTokens:
+    return ConnectTokens(
+        session_id=str(uuid.uuid4()),
+        ws_token=JWTConnectToken(jwt="expired_jwt", exp=1, endpoint="wss://test.qobuz.com/ws"),
+    )
+
+
+def _fresh_ws_token() -> WSToken:
+    return WSToken(jwt="renewed_jwt", exp_s=9999999999, endpoint="wss://test.qobuz.com/ws")
+
+
+class TestTokenRenewal:
+    """The app only resends tokens when the user re-selects the device, so an
+    expired token must be renewed by the proxy itself or the session dies."""
+
+    async def test_expired_token_is_renewed_without_the_app(self, config: Config) -> None:
+        renewer = AsyncMock(return_value=_fresh_ws_token())
+        ws_manager = WsManager(config, token_renewer=renewer)
+        ws_manager.set_tokens(_expired_tokens())
+        ws_manager._should_run = True
+
+        assert await asyncio.wait_for(ws_manager._wait_for_valid_token(60), timeout=1.0)
+
+        renewer.assert_awaited_once()
+        assert ws_manager._ws_token is not None
+        assert ws_manager._ws_token.jwt == "renewed_jwt"
+
+    async def test_failed_renewal_is_retried(
+        self, config: Config, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(ws_manager_module, "TOKEN_RENEW_RETRY_DELAY", 0.01)
+        renewer = AsyncMock(side_effect=[None, RuntimeError("offline"), _fresh_ws_token()])
+        ws_manager = WsManager(config, token_renewer=renewer)
+        ws_manager.set_tokens(_expired_tokens())
+        ws_manager._should_run = True
+
+        assert await asyncio.wait_for(ws_manager._wait_for_valid_token(60), timeout=1.0)
+        assert renewer.await_count == 3
+
+    async def test_app_token_still_accepted_while_renewal_fails(
+        self, config: Config, valid_tokens: ConnectTokens
+    ) -> None:
+        renewer = AsyncMock(return_value=None)
+        ws_manager = WsManager(config, token_renewer=renewer)
+        ws_manager.set_tokens(_expired_tokens())
+        ws_manager._should_run = True
+
+        wait_task = asyncio.create_task(ws_manager._wait_for_valid_token(60))
+        await asyncio.sleep(0.01)
+        assert wait_task.done() is False
+
+        ws_manager.set_tokens(valid_tokens)
+
+        assert await asyncio.wait_for(wait_task, timeout=1.0) is True
+
+    async def test_renewed_token_that_is_already_expiring_is_rejected(
+        self, config: Config, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(ws_manager_module, "TOKEN_RENEW_RETRY_DELAY", 0.01)
+        stale = WSToken(jwt="stale", exp_s=1, endpoint="wss://test.qobuz.com/ws")
+        renewer = AsyncMock(side_effect=[stale, _fresh_ws_token()])
+        ws_manager = WsManager(config, token_renewer=renewer)
+        ws_manager.set_tokens(_expired_tokens())
+        ws_manager._should_run = True
+
+        assert await asyncio.wait_for(ws_manager._wait_for_valid_token(60), timeout=1.0)
+        assert ws_manager._ws_token is not None
+        assert ws_manager._ws_token.jwt == "renewed_jwt"
 
 
 class TestHandlerRegistration:

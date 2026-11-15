@@ -7,7 +7,8 @@ Handles connection lifecycle, authentication, and message routing.
 import asyncio
 import logging
 import uuid
-from typing import Any, Callable, Dict, Optional
+import time
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 import websockets
 from websockets import ClientConnection
@@ -25,12 +26,15 @@ PING_INTERVAL = 10.0  # seconds
 PONG_TIMEOUT = 30.0  # seconds
 RECV_TIMEOUT = 1.0  # seconds (for periodic checks)
 TOKEN_REFRESH_BUFFER = 60  # seconds before expiry
+TOKEN_RENEW_RETRY_DELAY = 30.0  # seconds between failed self-renewal attempts
 INITIAL_RECONNECT_DELAY = 1.0  # seconds
 MAX_RECONNECT_DELAY = 60.0  # seconds
 RECONNECT_BACKOFF_MULTIPLIER = 2.0
 
 # Message handler callback type
 MessageHandler = Callable[[int, Any], None]
+# Mints a fresh WebSocket token without the app (None on failure)
+TokenRenewer = Callable[[], Awaitable[Optional[WSToken]]]
 
 
 class TokenRefreshRequired(Exception):
@@ -48,14 +52,18 @@ class WsManager:
     - Routing incoming messages to registered handlers
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, token_renewer: Optional[TokenRenewer] = None):
         """
         Initialize WebSocket manager.
 
         Args:
             config: Application configuration
+            token_renewer: Mints a fresh token when the current one expires. Without
+                it, an expired token waits for the Qobuz app to send a new one, which
+                it only does when the user selects this device again.
         """
         self.config = config
+        self._token_renewer = token_renewer
         self._device_uuid = self._uuid_to_bytes(config.device.uuid)
         self._codec = ProtocolCodec(self._device_uuid)
 
@@ -111,6 +119,10 @@ class WsManager:
 
         if self._ws_token:
             logger.debug(f"Tokens set, endpoint: {self._ws_token.endpoint[:50]}...")
+            logger.info(
+                f"WebSocket token from app expires in "
+                f"{(self._ws_token.exp_s - int(time.time())) // 60} min"
+            )
 
         tokens_changed = (
             previous_token != self._ws_token or previous_session_uuid != self._session_uuid
@@ -459,7 +471,7 @@ class WsManager:
             except asyncio.TimeoutError:
                 # Check token refresh
                 if self._ws_token and self._ws_token.is_expired(TOKEN_REFRESH_BUFFER):
-                    logger.warning("Token expiring soon, need refresh")
+                    logger.info("WebSocket token expiring soon, reconnecting with a fresh one")
                     raise TokenRefreshRequired()
 
             except websockets.ConnectionClosed:
@@ -525,6 +537,9 @@ class WsManager:
             ):
                 return True
 
+            if self._token_renewer is not None and await self._renew_token(buffer_s):
+                continue
+
             if not logged_wait:
                 logger.warning("Token expired, waiting for refreshed token from Qobuz app")
                 logged_wait = True
@@ -533,9 +548,35 @@ class WsManager:
             self._token_update_event.clear()
             if self._token_version != token_version:
                 continue
-            await self._token_update_event.wait()
+            if self._token_renewer is None:
+                await self._token_update_event.wait()
+                continue
+            # Renewal failed (network, Qobuz API): retry it later, or take the app's token
+            try:
+                await asyncio.wait_for(
+                    self._token_update_event.wait(), timeout=TOKEN_RENEW_RETRY_DELAY
+                )
+            except asyncio.TimeoutError:
+                pass
 
         return False
+
+    async def _renew_token(self, buffer_s: int) -> bool:
+        """Replace the expiring token with one minted by the token renewer."""
+        assert self._token_renewer is not None
+        try:
+            token = await self._token_renewer()
+        except Exception as e:
+            logger.warning(f"WebSocket token renewal failed: {type(e).__name__}: {e}")
+            return False
+        if token is None or not token.is_valid() or token.is_expired(buffer_s):
+            logger.warning("WebSocket token renewal returned no usable token")
+            return False
+        self._ws_token = token
+        logger.info(
+            f"Renewed WebSocket token, expires in {(token.exp_s - int(time.time())) // 60} min"
+        )
+        return True
 
     async def _close_for_token_refresh(self) -> None:
         """Close the current connection so refreshed tokens are used immediately."""

@@ -410,7 +410,10 @@ class Speaker:
                 component_config = self._build_component_config()
 
                 # Create WebSocket manager
-                self._ws_manager = WsManager(config=component_config)
+                self._ws_manager = WsManager(
+                    config=component_config,
+                    token_renewer=self._api_client.create_ws_token,
+                )
                 self._ws_manager.set_tokens(tokens)
                 self._ws_manager.set_max_audio_quality(self._effective_quality)
 

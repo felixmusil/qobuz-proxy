@@ -10,9 +10,11 @@ import logging
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode
 
 import aiohttp
+
+from qobuz_proxy.auth.tokens import WSToken
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +157,49 @@ class QobuzAPIClient:
             logger.error(f"Failed to start session: {e}")
 
         return False
+
+    async def create_ws_token(self) -> Optional[WSToken]:
+        """Mint a fresh Qobuz Connect WebSocket token from the user's auth token.
+
+        The token the app hands over on connect expires, and the app only sends a
+        new one when the user picks this device again. Connect renderers mint their
+        own instead (StreamCore32 ``getWSToken``): ``qws/refreshToken``, falling back
+        to ``qws/createToken``. Both answer ``{"jwt_qws": {jwt, exp, endpoint}}``.
+        """
+        if not self.user_auth_token:
+            return None
+        await self.start_session()
+        headers = self._report_headers()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        timeout = aiohttp.ClientTimeout(total=10)
+        for action in ("refreshToken", "createToken"):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{self.API_BASE}/qws/{action}",
+                        data="jwt=jwt_qws",
+                        headers=headers,
+                        timeout=timeout,
+                    ) as resp:
+                        if resp.status != 200:
+                            text = await resp.text()
+                            logger.warning(
+                                f"WebSocket token {action} failed: HTTP {resp.status} — "
+                                f"{text[:200]}"
+                            )
+                            continue
+                        jwt_qws = (await resp.json()).get("jwt_qws") or {}
+                token = WSToken(
+                    jwt=jwt_qws.get("jwt", ""),
+                    exp_s=int(jwt_qws.get("exp", 0)),
+                    endpoint=unquote(jwt_qws.get("endpoint", "")),
+                )
+                if token.is_valid():
+                    return token
+                logger.warning(f"WebSocket token {action} response was incomplete")
+            except Exception as e:
+                logger.warning(f"WebSocket token {action} error: {type(e).__name__}: {e}")
+        return None
 
     async def get_track_url(self, track_id: str, quality: int = 27) -> Optional[dict[str, Any]]:
         """
