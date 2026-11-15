@@ -30,7 +30,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# State polling interval
+# State polling interval. The poll loop is the only reader of device state:
+# get_state()/get_position() return its cached results, so callers polling
+# faster (the player checks every 0.5s) cost the renderer nothing. Each SOAP
+# call is a fresh TCP connection, and embedded renderers wedge under a steady
+# stream of them.
 STATE_POLL_INTERVAL_SECONDS = 2.0
 
 # Grace period after starting playback to ignore STOPPED state (seconds)
@@ -350,7 +354,11 @@ class DLNABackend(AudioBackend):
             self._notify_position_update(position_ms)
 
     async def get_position(self) -> int:
-        """Get current position."""
+        """Get the position last read by the poll loop."""
+        return self._position_ms
+
+    async def _query_position(self) -> int:
+        """Read the current position from the device."""
         if self._client:
             pos = await self._client.get_position_info()
             if pos is not None:
@@ -391,7 +399,11 @@ class DLNABackend(AudioBackend):
     # =========================================================================
 
     async def get_state(self) -> PlaybackState:
-        """Get current playback state from device."""
+        """Get the playback state last seen by the poll loop."""
+        return self._state
+
+    async def _query_state(self) -> PlaybackState:
+        """Read the current playback state from the device."""
         if not self._client:
             return PlaybackState.STOPPED
 
@@ -562,7 +574,7 @@ class DLNABackend(AudioBackend):
                     break
 
                 # Get state from device
-                new_state = await self.get_state()
+                new_state = await self._query_state()
 
                 # Check if we're in the grace period after starting playback
                 in_grace_period = (
@@ -631,7 +643,7 @@ class DLNABackend(AudioBackend):
 
                 # Update position while playing
                 if new_state == PlaybackState.PLAYING:
-                    pos = await self.get_position()
+                    pos = await self._query_position()
                     self._notify_position_update(pos)
 
             except asyncio.CancelledError:
