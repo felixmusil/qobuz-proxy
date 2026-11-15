@@ -1,6 +1,7 @@
 """Tests for WebSocket manager."""
 
 import asyncio
+import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
@@ -185,6 +186,27 @@ class TestTokenRenewal:
 
         assert await asyncio.wait_for(ws_manager._wait_for_valid_token(60), timeout=1.0)
         assert renewer.await_count == 3
+
+    async def test_failed_renewal_backs_off_up_to_a_cap(
+        self, config: Config, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(ws_manager_module, "TOKEN_RENEW_RETRY_DELAY", 0.01)
+        monkeypatch.setattr(ws_manager_module, "TOKEN_RENEW_MAX_RETRY_DELAY", 0.04)
+        calls: list[float] = []
+
+        async def renewer() -> WSToken | None:
+            calls.append(time.monotonic())
+            return _fresh_ws_token() if len(calls) == 6 else None
+
+        ws_manager = WsManager(config, token_renewer=renewer)
+        ws_manager.set_tokens(_expired_tokens())
+        ws_manager._should_run = True
+
+        assert await asyncio.wait_for(ws_manager._wait_for_valid_token(60), timeout=2.0)
+        gaps = [later - earlier for earlier, later in zip(calls, calls[1:])]
+        for gap, expected in zip(gaps, [0.01, 0.02, 0.04, 0.04, 0.04]):
+            assert gap >= expected * 0.9
+        assert gaps[-1] < 0.08  # capped, not still doubling
 
     async def test_app_token_still_accepted_while_renewal_fails(
         self, config: Config, valid_tokens: ConnectTokens

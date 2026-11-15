@@ -26,7 +26,8 @@ PING_INTERVAL = 10.0  # seconds
 PONG_TIMEOUT = 30.0  # seconds
 RECV_TIMEOUT = 1.0  # seconds (for periodic checks)
 TOKEN_REFRESH_BUFFER = 60  # seconds before expiry
-TOKEN_RENEW_RETRY_DELAY = 30.0  # seconds between failed self-renewal attempts
+TOKEN_RENEW_RETRY_DELAY = 30.0  # seconds before retrying a failed self-renewal
+TOKEN_RENEW_MAX_RETRY_DELAY = 1800.0  # cap: a refused renewal is retried twice an hour
 INITIAL_RECONNECT_DELAY = 1.0  # seconds
 MAX_RECONNECT_DELAY = 60.0  # seconds
 RECONNECT_BACKOFF_MULTIPLIER = 2.0
@@ -528,6 +529,7 @@ class WsManager:
     async def _wait_for_valid_token(self, buffer_s: int = 0) -> bool:
         """Wait until a non-expired token is available or shutdown is requested."""
         logged_wait = False
+        retry_delay = TOKEN_RENEW_RETRY_DELAY
 
         while self._should_run:
             if (
@@ -551,13 +553,12 @@ class WsManager:
             if self._token_renewer is None:
                 await self._token_update_event.wait()
                 continue
-            # Renewal failed (network, Qobuz API): retry it later, or take the app's token
+            # Renewal failed (network, Qobuz API): retry it later, backing off so a
+            # permanent refusal doesn't hit the API every 30s, or take the app's token
             try:
-                await asyncio.wait_for(
-                    self._token_update_event.wait(), timeout=TOKEN_RENEW_RETRY_DELAY
-                )
+                await asyncio.wait_for(self._token_update_event.wait(), timeout=retry_delay)
             except asyncio.TimeoutError:
-                pass
+                retry_delay = min(retry_delay * 2, TOKEN_RENEW_MAX_RETRY_DELAY)
 
         return False
 
